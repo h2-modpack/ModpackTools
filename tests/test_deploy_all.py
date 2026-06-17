@@ -99,12 +99,20 @@ def test_smoke_preflight_fails_before_deploy_on_smoke_error() -> None:
         )
 
 
+def test_fast_and_overwrite_are_rejected() -> None:
+    assert_raises(
+        "--fast and --overwrite",
+        lambda: deploy_all.validate_deploy_options(SimpleNamespace(fast=True, overwrite=True)),
+    )
+
+
 def main() -> int:
     tests = [
         test_smoke_preflight_skips_when_requested,
         test_smoke_preflight_skips_when_script_is_absent,
         test_smoke_preflight_runs_shell_smoke_script,
         test_smoke_preflight_fails_before_deploy_on_smoke_error,
+        test_fast_and_overwrite_are_rejected,
     ]
     for test in tests:
         test()

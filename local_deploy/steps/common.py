@@ -143,6 +143,14 @@ def discover_packages():
 def base_parser(description):
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument("--overwrite", action="store_true", help="Overwrite existing files/links (default: skip)")
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help=(
+            "Use a cache-backed incremental copy deploy. Only valid when link mode resolves to copy; "
+            "trusts the previous deploy cache and does not verify destination contents."
+        ),
+    )
     parser.add_argument("--profile", default=DEFAULT_PROFILE, help=f"r2modman profile name (default: {DEFAULT_PROFILE})")
     parser.add_argument(
         "--profile-root",

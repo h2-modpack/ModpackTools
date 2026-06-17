@@ -102,6 +102,12 @@ default. Use `--link-mode copy` or `--link-mode symlink` to force one mode, and
 `--profile-root PATH` when the profile directory cannot be discovered
 automatically.
 
+Use `--fast` for WSL-to-Windows edit/test loops when link mode resolves to
+`copy`. It keeps a profile-local deploy cache and copies only source files whose
+cached metadata changed. It trusts the previous deploy cache and does not verify
+destination contents; use `--overwrite` to repair a profile after manual edits,
+cache drift, or suspicious live state.
+
 ## Local Checkout Tests
 
 To run a broader local assembled-checkout sweep from the shell repo root:
