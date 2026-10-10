@@ -260,6 +260,57 @@ def test_prepare_release_reuses_existing_changelog_section() -> None:
     )
 
 
+def test_classify_bump_maps_conventional_types() -> None:
+    def bump(*subjects, body=""):
+        return prep.classify_bump([prep.Commit(f"{i:040d}", subject, body) for i, subject in enumerate(subjects)])
+
+    assert_equal(bump("fix: a"), "patch", "fix")
+    assert_equal(bump("perf(x): a", "fix: b"), "patch", "perf and fix")
+    assert_equal(bump("fix: a", "feat: b"), "minor", "feat outranks fix")
+    assert_equal(bump("feat!: a", "feat: b"), "major", "bang is breaking")
+    assert_equal(bump("fix: a", body="BREAKING CHANGE: gone"), "major", "breaking footer")
+    assert_equal(bump("chore: a", "docs: b", "refactor: c", "test: d"), None, "non-releasing types")
+    assert_equal(bump("chore(release): 5.0.0"), None, "release commit")
+    assert_equal(bump("not conventional"), None, "unparsed subject")
+    assert_equal(bump(), None, "no commits")
+
+
+def test_max_bump_and_bump_version() -> None:
+    assert_equal(prep.max_bump(None, "patch", "minor"), "minor", "max bump")
+    assert_equal(prep.max_bump(None, None), None, "no bumps")
+    assert_equal(prep.bump_version("5.2.3", "patch"), "5.2.4", "patch")
+    assert_equal(prep.bump_version("5.2.3", "minor"), "5.3.0", "minor resets patch")
+    assert_equal(prep.bump_version("5.2.3", "major"), "6.0.0", "major resets minor and patch")
+    assert_equal(prep.bump_version(None, "minor"), "1.0.0", "first release")
+    assert_raises("Invalid package version number", lambda: prep.bump_version("v5", "patch"))
+
+
+def test_commits_since_latest_tag_reads_history_after_newest_version_tag() -> None:
+    repo = init_repo()
+    write(repo, "a.txt", "1")
+    commit(repo, "feat: first")
+    git(repo, "tag", "1.0.0")
+    write(repo, "a.txt", "2")
+    commit(repo, "fix: second")
+    git(repo, "tag", "1.0.1")
+    write(repo, "a.txt", "3")
+    commit(repo, "feat: third")
+    write(repo, "a.txt", "4")
+    commit(repo, "chore: fourth")
+
+    tag, commits = prep.commits_since_latest_tag(repo)
+    assert_equal(tag, "1.0.1", "latest tag")
+    assert_equal([item.subject for item in commits], ["chore: fourth", "feat: third"], "commits since tag")
+    assert_equal(prep.classify_bump(commits), "minor", "implied bump")
+
+    fresh = init_repo()
+    write(fresh, "a.txt", "1")
+    commit(fresh, "fix: only")
+    tag, commits = prep.commits_since_latest_tag(fresh)
+    assert_equal(tag, None, "no tag yet")
+    assert_equal(len(commits), 1, "all commits when untagged")
+
+
 def main() -> int:
     tests = [
         test_parse_commits_groups_visible_conventional_types,
@@ -275,6 +326,9 @@ def main() -> int:
         test_update_dependency_pins_leaves_unmanaged_dependencies,
         test_prepare_release_uses_commits_since_previous_tag,
         test_prepare_release_reuses_existing_changelog_section,
+        test_classify_bump_maps_conventional_types,
+        test_max_bump_and_bump_version,
+        test_commits_since_latest_tag_reads_history_after_newest_version_tag,
     ]
     for test in tests:
         test()

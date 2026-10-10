@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import subprocess
 import sys
@@ -24,6 +25,9 @@ GITHUB_DIR = Path(__file__).resolve().parent
 TOOLS_DIR = GITHUB_DIR.parent
 ROOT_DIR = TOOLS_DIR.parent
 VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
+
+sys.path.insert(0, str(GITHUB_DIR))
+import prepare_package_release as prep  # noqa: E402
 
 
 class ReleaseError(Exception):
@@ -200,13 +204,13 @@ def normalize_release_target(
 
 def build_release_plan(
     config: ReleaseConfig,
-    tag: str,
+    tag: str | None,
     targets: str | None,
     available_module_repos: list[str] | None = None,
 ) -> ReleasePlan:
     requested_filter = (targets or "").strip()
     targeted = bool(requested_filter)
-    if not targeted:
+    if not targeted and tag is not None:
         validate_tag(tag, targeted)
 
     available_modules = (
@@ -245,7 +249,8 @@ def build_release_plan(
             "No release targets",
             "No module or coordinator release targets were selected.",
         )
-    validate_tag(tag, targeted)
+    if tag is not None:
+        validate_tag(tag, targeted)
     return plan
 
 
@@ -318,6 +323,170 @@ def workflow_field_value(fields: list[str], key: str) -> str | None:
         if separator and field_key.strip() == expected:
             return value.strip()
     return None
+
+
+@dataclass(frozen=True)
+class VersionPlanEntry:
+    repo: str
+    kind: str  # "module" or "coordinator"
+    last_tag: str | None
+    commit_count: int
+    bump: str | None
+    version: str | None  # None means the repo is skipped
+    source: str  # "commits", "override", "lockstep", "modules", "none"
+
+    @property
+    def released(self) -> bool:
+        return self.version is not None
+
+
+def parse_version_overrides(
+    raw: str | None,
+    config: ReleaseConfig,
+    available_module_repos: list[str],
+) -> dict[str, str]:
+    """Parse 'Target=Major.Minor.Patch,...' into {repo: version}, resolving target aliases."""
+    overrides: dict[str, str] = {}
+    for item in (raw or "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        target, separator, version = item.partition("=")
+        target = target.strip()
+        version = version.strip()
+        if not separator or not target or not VERSION_PATTERN.match(version):
+            raise ReleaseError(
+                "Invalid version override",
+                f"'{item}' must use Target=Major.Minor.Patch (e.g. LiveSplit=6.0.0).",
+            )
+        normalized = normalize_release_target(target, config, available_module_repos)
+        if normalized is None:
+            continue
+        overrides[normalized[1]] = version
+    return overrides
+
+
+def repo_release_state(config: ReleaseConfig, repo: str) -> tuple[str | None, int, str | None]:
+    """Return (last tag, commits since it, implied bump) for a checked-out repo."""
+    repo_path = release_repo_path(config, repo)
+    try:
+        last_tag, commits = prep.commits_since_latest_tag(repo_path)
+    except subprocess.CalledProcessError as exc:
+        raise ReleaseError(
+            "Invalid release checkout",
+            f"Could not read release history for {repo} at {repo_path}.",
+        ) from exc
+    return last_tag, len(commits), prep.classify_bump(commits)
+
+
+def plan_versions(
+    config: ReleaseConfig,
+    plan: ReleasePlan,
+    lockstep_tag: str | None = None,
+    overrides: dict[str, str] | None = None,
+) -> list[VersionPlanEntry]:
+    """Resolve the version each selected repo will release, skipping repos with nothing to ship."""
+    overrides = overrides or {}
+    entries: list[VersionPlanEntry] = []
+    module_bumps: list[str | None] = []
+
+    for repo in plan.module_repos:
+        last_tag, count, bump = repo_release_state(config, repo)
+        if lockstep_tag is not None:
+            version, source = lockstep_tag, "lockstep"
+        elif repo in overrides:
+            version, source = overrides[repo], "override"
+        elif bump is not None:
+            version, source = prep.bump_version(last_tag, bump), "commits"
+        else:
+            version, source = None, "none"
+        if version is not None and source != "lockstep":
+            module_bumps.append(bump or "patch")
+        entries.append(VersionPlanEntry(repo, "module", last_tag, count, bump, version, source))
+
+    if plan.coordinator_selected:
+        repo = config.coordinator_repo
+        last_tag, count, own_bump = repo_release_state(config, repo)
+        released_modules = any(entry.released for entry in entries)
+        if lockstep_tag is not None:
+            version, bump, source = lockstep_tag, own_bump, "lockstep"
+        elif repo in overrides:
+            version, bump, source = overrides[repo], own_bump, "override"
+        elif released_modules or own_bump is not None:
+            # At least a patch whenever any module ships; otherwise the largest bump wins.
+            bump = prep.max_bump(own_bump, *module_bumps) or "patch"
+            version = prep.bump_version(last_tag, bump)
+            source = "modules" if released_modules else "commits"
+        else:
+            version, bump, source = None, None, "none"
+        entries.append(VersionPlanEntry(repo, "coordinator", last_tag, count, bump, version, source))
+
+    return entries
+
+
+def build_coordinator_version_pins(
+    config: ReleaseConfig,
+    entries: list[VersionPlanEntry],
+    available_module_repos: list[str],
+) -> dict[str, str]:
+    """Pin every module: released ones to their new version, the rest to their latest tag."""
+    released = {entry.repo: entry.version for entry in entries if entry.kind == "module" and entry.version}
+    pins: dict[str, str] = {}
+    for repo in available_module_repos:
+        if repo in released:
+            pins[repo] = released[repo]
+            continue
+        latest = prep.latest_version_tag(release_repo_path(config, repo))
+        if latest:
+            pins[repo] = latest
+    return pins
+
+
+def build_dependency_pins_field(pins: dict[str, str]) -> str | None:
+    if not pins:
+        return None
+    return "dependency-pins=" + ",".join(f"{repo}={version}" for repo, version in pins.items())
+
+
+def format_version_plan(entries: list[VersionPlanEntry]) -> str:
+    rows = [("Repo", "Last tag", "Commits", "Bump", "Next version")]
+    for entry in entries:
+        rows.append(
+            (
+                entry.repo,
+                entry.last_tag or "-",
+                str(entry.commit_count),
+                entry.bump or "-",
+                entry.version if entry.version else f"skip ({entry.source})",
+            )
+        )
+        if entry.version and entry.source in {"override", "lockstep"}:
+            rows[-1] = rows[-1][:-1] + (f"{entry.version} ({entry.source})",)
+    widths = [max(len(row[index]) for row in rows) for index in range(len(rows[0]))]
+    return "\n".join(
+        "  " + "  ".join(cell.ljust(widths[index]) for index, cell in enumerate(row)).rstrip()
+        for row in rows
+    )
+
+
+def write_step_summary(entries: list[VersionPlanEntry]) -> None:
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path:
+        return
+    lines = ["### Release plan", "", "| Repo | Last tag | Commits | Bump | Next version |", "| --- | --- | --- | --- | --- |"]
+    for entry in entries:
+        version = entry.version if entry.version else f"skip ({entry.source})"
+        lines.append(
+            f"| {entry.repo} | {entry.last_tag or '-'} | {entry.commit_count} | {entry.bump or '-'} | {version} |"
+        )
+    with open(summary_path, "a", encoding="utf-8") as handle:
+        handle.write("\n".join(lines) + "\n")
+
+
+def print_version_plan(entries: list[VersionPlanEntry]) -> None:
+    print("Release plan:")
+    print(format_version_plan(entries))
+    write_step_summary(entries)
 
 
 def run_gh(args: list[str], capture_json: bool = False) -> object | None:
@@ -498,6 +667,23 @@ def verify_release_plan_ci(
     print("==========================================")
     for repo in repos:
         verify_repo_ci(config, repo, tag, child_dry_run)
+
+
+def verify_version_plan_ci(
+    config: ReleaseConfig,
+    entries: list[VersionPlanEntry],
+    child_dry_run: bool,
+) -> None:
+    released = [entry for entry in entries if entry.released]
+    if not released:
+        return
+
+    print("")
+    print("==========================================")
+    print("  Release CI preflight")
+    print("==========================================")
+    for entry in released:
+        verify_repo_ci(config, entry.repo, entry.version, child_dry_run)
 
 
 def list_release_runs(config: ReleaseConfig, repo: str) -> list[dict]:
@@ -717,6 +903,34 @@ def dispatch_release_plan(
     print("==========================================")
 
 
+def dispatch_version_plan(
+    config: ReleaseConfig,
+    entries: list[VersionPlanEntry],
+    child_dry_run: bool,
+    repo_fields: dict[str, list[str]] | None = None,
+    module_fields: list[str] | None = None,
+    coordinator_fields: list[str] | None = None,
+) -> None:
+    released = [entry for entry in entries if entry.released]
+    succeeded = 0
+    for entry in released:
+        modules = entry.kind == "module"
+        succeeded += release_phase(
+            config,
+            f"{'Module' if modules else 'Coordinator'} release: {entry.repo} {entry.version}",
+            [entry.repo],
+            entry.version,
+            child_dry_run,
+            repo_fields,
+            module_fields if modules else coordinator_fields,
+        )
+
+    print("")
+    print("==========================================")
+    print(f"  Completed: {succeeded} / {len(released)}")
+    print("==========================================")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Coordinate pack-wide release dispatches.")
     parser.add_argument("--org", required=True, help="GitHub org that owns the pack repos.")
@@ -732,7 +946,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Deprecated compatibility option. Shared dependencies are not released by release_all.",
     )
-    parser.add_argument("--tag", required=True, help="Release version tag.")
+    parser.add_argument(
+        "--tag",
+        default=None,
+        help="Lockstep release version applied to every selected repo. Omit to compute per-repo versions from commits.",
+    )
+    parser.add_argument(
+        "--versions",
+        default="",
+        help="Comma-separated Target=Major.Minor.Patch overrides for computed versions (e.g. LiveSplit=6.0.0).",
+    )
     parser.add_argument("--targets", nargs="?", default="", const="", help="Comma-separated release targets. Blank means all.")
     parser.add_argument("--child-dry-run", default="false", help="Pass dry-run mode to child release workflows.")
     parser.add_argument("--plan-only", action="store_true", help="Validate and print the plan without dispatching.")
@@ -770,6 +993,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def run_computed_release(
+    config: ReleaseConfig,
+    plan: ReleasePlan,
+    args: argparse.Namespace,
+    child_dry_run: bool,
+    repo_fields: dict[str, list[str]],
+    module_fields: list[str],
+    coordinator_fields: list[str],
+) -> int:
+    available_modules = discover_module_repos(config)
+    overrides = parse_version_overrides(args.versions, config, available_modules)
+    entries = plan_versions(config, plan, None, overrides)
+    print_version_plan(entries)
+
+    if not any(entry.released for entry in entries):
+        print("Nothing to release: no selected repo has releasable commits since its last tag.")
+        return 0
+
+    if args.pin_coordinator_module_deps:
+        pins = build_coordinator_version_pins(config, entries, available_modules)
+        pin_field = build_dependency_pins_field(pins)
+        if pin_field is not None:
+            coordinator_fields.append(pin_field)
+    if args.verify_ci:
+        verify_version_plan_ci(config, entries, child_dry_run)
+    if not args.plan_only:
+        dispatch_version_plan(config, entries, child_dry_run, repo_fields, module_fields, coordinator_fields)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
@@ -790,7 +1043,14 @@ def main(argv: list[str] | None = None) -> int:
         repo_fields = parse_repo_fields(args.repo_field)
         module_fields = parse_workflow_fields(args.module_field)
         coordinator_fields = parse_workflow_fields(args.coordinator_field)
+        if args.tag and args.versions.strip():
+            raise ReleaseError(
+                "Conflicting version inputs",
+                "Pass either a lockstep tag or per-repo versions, not both.",
+            )
         plan = build_release_plan(config, args.tag, args.targets)
+        if args.tag is None:
+            return run_computed_release(config, plan, args, child_dry_run, repo_fields, module_fields, coordinator_fields)
         if args.pin_coordinator_module_deps:
             dependency_pin_field = build_coordinator_dependency_pin_field(plan.module_repos, args.tag)
             if dependency_pin_field is not None:

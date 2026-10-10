@@ -125,15 +125,29 @@ arbitrary test files.
 
 Normal release maintenance is:
 
-1. Module, coordinator, or Lib repos change and are pushed.
-2. Update and commit the shell submodule pointers as part of that development work.
-3. Run `Release All` from the shell repo when publishing the pack.
+1. Module, coordinator, or Lib repos change and are pushed with conventional commits.
+2. Run `Release All` from the shell repo when publishing the pack.
 
-`Release All` validates the checked-out shell snapshot before dispatching child
-release workflows. The dependency validator checks that required Thunderstore
+`Release All` checks out every child repo at its release branch head, so stale
+shell submodule pointers never block a release, and commits the new pointers back
+to the shell once the release finishes. It then validates that snapshot before
+dispatching child release workflows.
+
+By default each repo gets its own version, computed from its conventional commits
+since its last tag: a breaking change bumps major, `feat` bumps minor, `fix` and
+`perf` bump patch. `chore`, `docs`, `refactor`, `test` and the bot's
+`chore(release)` commits do not release on their own, so repos with nothing to
+ship are skipped. The coordinator bumps at least a patch whenever any module
+ships (the largest module bump otherwise wins) and pins every module to its real
+latest version. The plan is printed, and written to the workflow summary, before
+anything is dispatched; run with the dry-run option first to preview it. Use the
+`versions` input (`LiveSplit=6.0.0,Coordinator=6.1.0`) to override or force a
+repo's version, or `tag` to give every selected repo the same version (lockstep:
+mass releases must end in `.0`, targeted ones in a non-zero patch). The dependency validator checks that required Thunderstore
 dependency edges exist, and prints the checked-out package versions plus current
 source pins for auditability. The release dispatcher can also verify that each
-selected child repo matches the configured release branch head and has a
+selected child repo matches the configured release branch head (always true once
+the heads are checked out) and has a
 successful `ci.yaml` run for that commit. It does not require exact dependency
 pin equality because Thunderstore resolves package dependencies to the latest
 available version.

@@ -555,6 +555,230 @@ def test_release_phase_skips_existing_releases() -> None:
         release_all.watch_repo = old_watch_repo
 
 
+COORDINATOR = "adamantRunDirector-RunDirector_Modpack"
+
+
+class patched:
+    """Temporarily replace module attributes."""
+
+    def __init__(self, target, **replacements):
+        self.target = target
+        self.replacements = replacements
+        self.originals = {}
+
+    def __enter__(self):
+        for name, value in self.replacements.items():
+            self.originals[name] = getattr(self.target, name)
+            setattr(self.target, name, value)
+
+    def __exit__(self, *_):
+        for name, value in self.originals.items():
+            setattr(self.target, name, value)
+
+
+def fake_state(states):
+    def read(_config, repo):
+        return states[repo]
+
+    return read
+
+
+def test_plan_versions_computes_per_repo_versions_and_skips_unchanged() -> None:
+    config = make_config()
+    plan = release_all.ReleasePlan(module_repos=list(MODULE_REPOS), coordinator_selected=True)
+    states = {
+        MODULE_REPOS[0]: ("2.1.0", 3, "minor"),
+        MODULE_REPOS[1]: ("1.4.2", 0, None),
+        MODULE_REPOS[2]: ("5.0.0", 1, "patch"),
+        COORDINATOR: ("3.0.0", 2, None),
+    }
+    with patched(release_all, repo_release_state=fake_state(states)):
+        entries = release_all.plan_versions(config, plan)
+    by_repo = {entry.repo: entry for entry in entries}
+
+    assert_equal(by_repo[MODULE_REPOS[0]].version, "2.2.0", "feat bumps minor")
+    assert_equal(by_repo[MODULE_REPOS[1]].version, None, "unchanged module skipped")
+    assert_equal(by_repo[MODULE_REPOS[2]].version, "5.0.1", "fix bumps patch")
+    assert_equal(by_repo[COORDINATOR].version, "3.1.0", "coordinator takes the largest module bump")
+    assert_equal(by_repo[COORDINATOR].source, "modules", "coordinator source")
+
+
+def test_plan_versions_coordinator_gets_at_least_a_patch() -> None:
+    config = make_config()
+    plan = release_all.ReleasePlan(module_repos=[MODULE_REPOS[0]], coordinator_selected=True)
+    states = {
+        MODULE_REPOS[0]: ("2.1.0", 1, "patch"),
+        COORDINATOR: ("3.0.0", 0, None),
+    }
+    with patched(release_all, repo_release_state=fake_state(states)):
+        entries = release_all.plan_versions(config, plan)
+    assert_equal(entries[-1].version, "3.0.1", "coordinator patch")
+
+
+def test_plan_versions_skips_everything_when_nothing_releasable() -> None:
+    config = make_config()
+    plan = release_all.ReleasePlan(module_repos=[MODULE_REPOS[0]], coordinator_selected=True)
+    states = {
+        MODULE_REPOS[0]: ("2.1.0", 0, None),
+        COORDINATOR: ("3.0.0", 1, None),
+    }
+    with patched(release_all, repo_release_state=fake_state(states)):
+        entries = release_all.plan_versions(config, plan)
+    assert_true(not any(entry.released for entry in entries), "nothing released")
+
+
+def test_plan_versions_override_wins_and_forces_release() -> None:
+    config = make_config()
+    plan = release_all.ReleasePlan(module_repos=[MODULE_REPOS[1]], coordinator_selected=True)
+    states = {
+        MODULE_REPOS[1]: ("1.4.2", 0, None),
+        COORDINATOR: ("3.0.0", 0, None),
+    }
+    overrides = {MODULE_REPOS[1]: "6.0.0", COORDINATOR: "7.0.0"}
+    with patched(release_all, repo_release_state=fake_state(states)):
+        entries = release_all.plan_versions(config, plan, None, overrides)
+    assert_equal([entry.version for entry in entries], ["6.0.0", "7.0.0"], "override versions")
+    assert_equal([entry.source for entry in entries], ["override", "override"], "override sources")
+
+
+def test_plan_versions_lockstep_applies_one_tag_to_every_selected_repo() -> None:
+    config = make_config()
+    plan = release_all.ReleasePlan(module_repos=[MODULE_REPOS[0], MODULE_REPOS[1]], coordinator_selected=True)
+    states = {
+        MODULE_REPOS[0]: ("2.1.0", 1, "patch"),
+        MODULE_REPOS[1]: ("1.4.2", 0, None),
+        COORDINATOR: ("3.0.0", 0, None),
+    }
+    with patched(release_all, repo_release_state=fake_state(states)):
+        entries = release_all.plan_versions(config, plan, "9.0.0")
+    assert_equal([entry.version for entry in entries], ["9.0.0", "9.0.0", "9.0.0"], "lockstep versions")
+
+
+def test_parse_version_overrides_resolves_aliases_and_validates() -> None:
+    config = make_config()
+    overrides = release_all.parse_version_overrides(
+        "GodPool=2.0.0, Coordinator=4.1.0", config, MODULE_REPOS
+    )
+    assert_equal(overrides, {MODULE_REPOS[2]: "2.0.0", COORDINATOR: "4.1.0"}, "parsed overrides")
+    assert_equal(release_all.parse_version_overrides("", config, MODULE_REPOS), {}, "empty overrides")
+    for bad in ("GodPool", "GodPool=2.0", "GodPool=v2.0.0"):
+        try:
+            release_all.parse_version_overrides(bad, config, MODULE_REPOS)
+        except release_all.ReleaseError as exc:
+            assert_equal(exc.title, "Invalid version override", f"error title for {bad!r}")
+        else:
+            raise AssertionError(f"expected invalid override for {bad!r}")
+
+
+def test_coordinator_version_pins_cover_every_module() -> None:
+    config = make_config()
+    entries = [
+        release_all.VersionPlanEntry(MODULE_REPOS[0], "module", "2.1.0", 3, "minor", "2.2.0", "commits"),
+        release_all.VersionPlanEntry(MODULE_REPOS[1], "module", "1.4.2", 0, None, None, "none"),
+        release_all.VersionPlanEntry(COORDINATOR, "coordinator", "3.0.0", 0, "minor", "3.1.0", "modules"),
+    ]
+    latest = {MODULE_REPOS[1]: "1.4.2", MODULE_REPOS[2]: "5.0.0"}
+    with patched(release_all.prep, latest_version_tag=lambda path: latest.get(path.name)):
+        pins = release_all.build_coordinator_version_pins(config, entries, MODULE_REPOS)
+    assert_equal(pins, {
+        MODULE_REPOS[0]: "2.2.0",
+        MODULE_REPOS[1]: "1.4.2",
+        MODULE_REPOS[2]: "5.0.0",
+    }, "pins")
+    assert_equal(
+        release_all.build_dependency_pins_field(pins),
+        "dependency-pins="
+        f"{MODULE_REPOS[0]}=2.2.0,{MODULE_REPOS[1]}=1.4.2,{MODULE_REPOS[2]}=5.0.0",
+        "pin field",
+    )
+    assert_equal(release_all.build_dependency_pins_field({}), None, "empty pin field")
+
+
+def test_format_version_plan_marks_skips_and_overrides() -> None:
+    entries = [
+        release_all.VersionPlanEntry(MODULE_REPOS[0], "module", "2.1.0", 3, "minor", "2.2.0", "commits"),
+        release_all.VersionPlanEntry(MODULE_REPOS[1], "module", "1.4.2", 0, None, None, "none"),
+        release_all.VersionPlanEntry(MODULE_REPOS[2], "module", None, 4, None, "6.0.0", "override"),
+    ]
+    text = release_all.format_version_plan(entries)
+    assert_true("2.2.0" in text, "next version shown")
+    assert_true("skip (none)" in text, "skip shown")
+    assert_true("6.0.0 (override)" in text, "override shown")
+
+
+def test_dispatch_version_plan_uses_each_repos_own_version_and_skips_unreleased() -> None:
+    config = make_config()
+    entries = [
+        release_all.VersionPlanEntry(MODULE_REPOS[0], "module", "2.1.0", 3, "minor", "2.2.0", "commits"),
+        release_all.VersionPlanEntry(MODULE_REPOS[1], "module", "1.4.2", 0, None, None, "none"),
+        release_all.VersionPlanEntry(COORDINATOR, "coordinator", "3.0.0", 0, "minor", "3.1.0", "modules"),
+    ]
+    dispatched: list[tuple[str, str, tuple[str, ...]]] = []
+
+    def fake_dispatch_repo(_config, repo, tag, _dry, _repo_fields, shared_fields):
+        dispatched.append((repo, tag, tuple(shared_fields or [])))
+        return len(dispatched)
+
+    with patched(
+        release_all,
+        release_exists=lambda *_: False,
+        dispatch_repo=fake_dispatch_repo,
+        watch_repo=lambda *_: None,
+    ):
+        release_all.dispatch_version_plan(
+            config,
+            entries,
+            False,
+            module_fields=["tools-ref=v"],
+            coordinator_fields=["dependency-pins=x=1.0.0"],
+        )
+    assert_equal(dispatched, [
+        (MODULE_REPOS[0], "2.2.0", ("tools-ref=v",)),
+        (COORDINATOR, "3.1.0", ("dependency-pins=x=1.0.0",)),
+    ], "dispatches")
+
+
+def test_verify_version_plan_ci_checks_only_released_repos() -> None:
+    config = make_config()
+    entries = [
+        release_all.VersionPlanEntry(MODULE_REPOS[0], "module", "2.1.0", 3, "minor", "2.2.0", "commits"),
+        release_all.VersionPlanEntry(MODULE_REPOS[1], "module", "1.4.2", 0, None, None, "none"),
+    ]
+    checked: list[tuple[str, str]] = []
+    with patched(release_all, verify_repo_ci=lambda _c, repo, tag, _d: checked.append((repo, tag))):
+        release_all.verify_version_plan_ci(config, entries, False)
+    assert_equal(checked, [(MODULE_REPOS[0], "2.2.0")], "ci checks")
+
+
+def test_main_rejects_tag_combined_with_versions() -> None:
+    code = release_all.main([
+        "--org", "o", "--team", "adamantRunDirector", "--coordinator-repo", COORDINATOR,
+        "--tag", "1.0.0", "--versions", "GodPool=2.0.0", "--plan-only",
+    ])
+    assert_equal(code, 1, "exit code")
+
+
+def test_run_computed_release_does_nothing_when_nothing_is_releasable() -> None:
+    config = make_config()
+    plan = release_all.ReleasePlan(module_repos=[MODULE_REPOS[0]], coordinator_selected=False)
+    args = release_all.build_parser().parse_args([
+        "--org", "o", "--team", "adamantRunDirector", "--coordinator-repo", COORDINATOR,
+    ])
+    states = {MODULE_REPOS[0]: ("2.1.0", 0, None)}
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("must not dispatch")
+
+    with patched(
+        release_all,
+        repo_release_state=fake_state(states),
+        discover_module_repos=lambda _config: list(MODULE_REPOS),
+        dispatch_version_plan=boom,
+    ):
+        code = release_all.run_computed_release(config, plan, args, False, {}, [], [])
+    assert_equal(code, 0, "exit code")
+
+
 def main() -> int:
     tests = [
         test_mass_release_selects_all_modules_and_coordinator,
@@ -583,6 +807,18 @@ def main() -> int:
         test_dispatch_plan_releases_modules_and_coordinator_only,
         test_release_phase_waits_for_each_repo_before_dispatching_next,
         test_release_phase_skips_existing_releases,
+        test_plan_versions_computes_per_repo_versions_and_skips_unchanged,
+        test_plan_versions_coordinator_gets_at_least_a_patch,
+        test_plan_versions_skips_everything_when_nothing_releasable,
+        test_plan_versions_override_wins_and_forces_release,
+        test_plan_versions_lockstep_applies_one_tag_to_every_selected_repo,
+        test_parse_version_overrides_resolves_aliases_and_validates,
+        test_coordinator_version_pins_cover_every_module,
+        test_format_version_plan_marks_skips_and_overrides,
+        test_dispatch_version_plan_uses_each_repos_own_version_and_skips_unreleased,
+        test_verify_version_plan_ci_checks_only_released_repos,
+        test_main_rejects_tag_combined_with_versions,
+        test_run_computed_release_does_nothing_when_nothing_is_releasable,
     ]
 
     for test in tests:

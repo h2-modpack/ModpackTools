@@ -132,6 +132,59 @@ def read_commits(repo: Path, previous_tag: str | None) -> list[Commit]:
     return commits
 
 
+BUMP_RANK = {"patch": 1, "minor": 2, "major": 3}
+BUMP_BY_TYPE = {"feat": "minor", "fix": "patch", "perf": "patch"}
+
+
+def max_bump(*bumps: str | None) -> str | None:
+    ranked = [bump for bump in bumps if bump]
+    return max(ranked, key=lambda bump: BUMP_RANK[bump]) if ranked else None
+
+
+def classify_bump(commits: list[Commit]) -> str | None:
+    """Return the semver bump implied by conventional commits, or None when nothing is releasable.
+
+    A breaking change bumps major, feat bumps minor, fix/perf bump patch. chore, docs, refactor,
+    test and the bot's chore(release) commits do not trigger a release on their own.
+    """
+    bump = None
+    for commit in commits:
+        match = CONVENTIONAL_PATTERN.match(commit.subject)
+        if not match:
+            continue
+        commit_type, _, bang, _ = match.groups()
+        if bang or BREAKING_PATTERN.search(commit.body):
+            bump = max_bump(bump, "major")
+        else:
+            bump = max_bump(bump, BUMP_BY_TYPE.get(commit_type.lower()))
+    return bump
+
+
+def bump_version(version: str | None, bump: str) -> str:
+    """Apply a bump to Major.Minor.Patch. A repo with no previous tag starts at 1.0.0."""
+    if version is None:
+        return "1.0.0"
+    validate_tag(version)
+    major, minor, patch = (int(part) for part in version.split("."))
+    if bump == "major":
+        return f"{major + 1}.0.0"
+    if bump == "minor":
+        return f"{major}.{minor + 1}.0"
+    if bump == "patch":
+        return f"{major}.{minor}.{patch + 1}"
+    raise ReleasePrepError("Invalid version bump", f"Unknown bump '{bump}'.")
+
+
+def latest_version_tag(repo: Path) -> str | None:
+    """Highest Major.Minor.Patch tag reachable from HEAD."""
+    return find_previous_tag(repo, "")
+
+
+def commits_since_latest_tag(repo: Path) -> tuple[str | None, list[Commit]]:
+    previous_tag = latest_version_tag(repo)
+    return previous_tag, read_commits(repo, previous_tag)
+
+
 def _first_line(value: str) -> str:
     return (value or "").strip().splitlines()[0].strip()
 
