@@ -779,6 +779,71 @@ def test_run_computed_release_does_nothing_when_nothing_is_releasable() -> None:
     assert_equal(code, 0, "exit code")
 
 
+def raises_release_error(title, func) -> None:
+    try:
+        func()
+    except release_all.ReleaseError as exc:
+        assert_equal(exc.title, title, "error title")
+        return
+    raise AssertionError(f"expected ReleaseError titled {title!r}")
+
+
+def test_repo_release_state_rejects_shallow_checkout() -> None:
+    config = make_config()
+    with patched(release_all.prep, is_shallow=lambda _path: True):
+        raises_release_error("Shallow release checkout", lambda: release_all.repo_release_state(config, MODULE_REPOS[0]))
+
+
+def test_repo_release_state_rejects_unreachable_latest_tag() -> None:
+    config = make_config()
+    commit = release_all.prep.Commit("a" * 40, "fix: x", "")
+    with patched(
+        release_all.prep,
+        is_shallow=lambda _path: False,
+        commits_since_latest_tag=lambda _path: (None, [commit]),
+        all_version_tags=lambda _path: ["5.2.1", "5.0.0"],
+    ):
+        raises_release_error(
+            "Incomplete release history",
+            lambda: release_all.repo_release_state(config, MODULE_REPOS[0]),
+        )
+
+
+def test_repo_release_state_accepts_complete_history_and_new_repos() -> None:
+    config = make_config()
+    commit = release_all.prep.Commit("a" * 40, "feat: x", "")
+    with patched(
+        release_all.prep,
+        is_shallow=lambda _path: False,
+        commits_since_latest_tag=lambda _path: ("5.2.1", [commit]),
+        all_version_tags=lambda _path: ["5.2.1", "5.0.0"],
+    ):
+        assert_equal(release_all.repo_release_state(config, MODULE_REPOS[0]), ("5.2.1", 1, "minor"), "complete history")
+    with patched(
+        release_all.prep,
+        is_shallow=lambda _path: False,
+        commits_since_latest_tag=lambda _path: (None, [commit]),
+        all_version_tags=lambda _path: [],
+    ):
+        assert_equal(release_all.repo_release_state(config, MODULE_REPOS[0]), (None, 1, "minor"), "untagged repo")
+
+
+def test_plan_versions_rejects_override_not_above_last_tag() -> None:
+    config = make_config()
+    plan = release_all.ReleasePlan(module_repos=[MODULE_REPOS[0]], coordinator_selected=False)
+    states = {MODULE_REPOS[0]: ("5.2.1", 1, "patch")}
+    with patched(release_all, repo_release_state=fake_state(states)):
+        for version in ("5.2.1", "5.0.0", "1.0.0"):
+            raises_release_error(
+                "Version not above last release",
+                lambda version=version: release_all.plan_versions(
+                    config, plan, None, {MODULE_REPOS[0]: version}
+                ),
+            )
+        entries = release_all.plan_versions(config, plan, None, {MODULE_REPOS[0]: "5.2.2"})
+    assert_equal(entries[0].version, "5.2.2", "override above last tag")
+
+
 def main() -> int:
     tests = [
         test_mass_release_selects_all_modules_and_coordinator,
@@ -819,6 +884,10 @@ def main() -> int:
         test_verify_version_plan_ci_checks_only_released_repos,
         test_main_rejects_tag_combined_with_versions,
         test_run_computed_release_does_nothing_when_nothing_is_releasable,
+        test_repo_release_state_rejects_shallow_checkout,
+        test_repo_release_state_rejects_unreachable_latest_tag,
+        test_repo_release_state_accepts_complete_history_and_new_repos,
+        test_plan_versions_rejects_override_not_above_last_tag,
     ]
 
     for test in tests:

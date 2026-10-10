@@ -370,13 +370,39 @@ def repo_release_state(config: ReleaseConfig, repo: str) -> tuple[str | None, in
     """Return (last tag, commits since it, implied bump) for a checked-out repo."""
     repo_path = release_repo_path(config, repo)
     try:
+        if prep.is_shallow(repo_path):
+            raise ReleaseError(
+                "Shallow release checkout",
+                f"{repo} is a shallow checkout, so its release history is incomplete. "
+                "Fetch full history (git fetch --unshallow --tags) before planning versions.",
+            )
         last_tag, commits = prep.commits_since_latest_tag(repo_path)
+        known_tags = prep.all_version_tags(repo_path)
     except subprocess.CalledProcessError as exc:
         raise ReleaseError(
             "Invalid release checkout",
             f"Could not read release history for {repo} at {repo_path}.",
         ) from exc
+    if known_tags and known_tags[0] != last_tag:
+        raise ReleaseError(
+            "Incomplete release history",
+            f"{repo} has tag {known_tags[0]} but its latest reachable tag is {last_tag or 'none'}. "
+            "The checkout is missing history or the tag is not on the release branch; refusing to guess a version.",
+        )
     return last_tag, len(commits), prep.classify_bump(commits)
+
+
+def version_key(version: str) -> tuple[int, int, int]:
+    major, minor, patch = (int(part) for part in version.split("."))
+    return (major, minor, patch)
+
+
+def require_above_last_tag(repo: str, version: str, last_tag: str | None) -> None:
+    if last_tag is not None and version_key(version) <= version_key(last_tag):
+        raise ReleaseError(
+            "Version not above last release",
+            f"{repo} would release {version}, which is not above its latest tag {last_tag}.",
+        )
 
 
 def plan_versions(
@@ -401,6 +427,7 @@ def plan_versions(
         else:
             version, source = None, "none"
         if version is not None and source != "lockstep":
+            require_above_last_tag(repo, version, last_tag)
             module_bumps.append(bump or "patch")
         entries.append(VersionPlanEntry(repo, "module", last_tag, count, bump, version, source))
 
@@ -419,6 +446,8 @@ def plan_versions(
             source = "modules" if released_modules else "commits"
         else:
             version, bump, source = None, None, "none"
+        if version is not None and source != "lockstep":
+            require_above_last_tag(repo, version, last_tag)
         entries.append(VersionPlanEntry(repo, "coordinator", last_tag, count, bump, version, source))
 
     return entries

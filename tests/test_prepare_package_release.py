@@ -311,6 +311,35 @@ def test_commits_since_latest_tag_reads_history_after_newest_version_tag() -> No
     assert_equal(len(commits), 1, "all commits when untagged")
 
 
+def test_all_version_tags_and_shallow_detection() -> None:
+    repo = init_repo()
+    write(repo, "a.txt", "1")
+    commit(repo, "feat: first")
+    git(repo, "tag", "1.0.0")
+    write(repo, "a.txt", "2")
+    commit(repo, "fix: second")
+    git(repo, "tag", "1.0.1")
+    git(repo, "tag", "not-a-version")
+    write(repo, "a.txt", "3")
+    commit(repo, "feat: third")
+
+    assert_equal(prep.all_version_tags(repo), ["1.0.1", "1.0.0"], "version tags only, highest first")
+    assert_equal(prep.is_shallow(repo), False, "full repo")
+
+    shallow = Path(tempfile.mkdtemp()) / "clone"
+    subprocess.run(
+        ["git", "clone", "--depth", "1", "--no-single-branch", repo.as_uri(), str(shallow)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    git(shallow, "fetch", "--tags", "--quiet")
+    assert_equal(prep.is_shallow(shallow), True, "shallow clone")
+    # The failure this guards against: tags exist, but none is reachable from the shallow HEAD.
+    assert_equal(prep.latest_version_tag(shallow), None, "no reachable tag in a shallow clone")
+    assert_equal(prep.all_version_tags(shallow)[0], "1.0.1", "tags still known")
+
+
 def main() -> int:
     tests = [
         test_parse_commits_groups_visible_conventional_types,
@@ -329,6 +358,7 @@ def main() -> int:
         test_classify_bump_maps_conventional_types,
         test_max_bump_and_bump_version,
         test_commits_since_latest_tag_reads_history_after_newest_version_tag,
+        test_all_version_tags_and_shallow_detection,
     ]
     for test in tests:
         test()

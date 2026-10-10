@@ -180,6 +180,16 @@ def latest_version_tag(repo: Path) -> str | None:
     return find_previous_tag(repo, "")
 
 
+def all_version_tags(repo: Path) -> list[str]:
+    """Every Major.Minor.Patch tag in the repo, highest first, reachable or not."""
+    tags = run_git(repo, ["tag", "--sort=-v:refname"]).splitlines()
+    return [tag.strip() for tag in tags if VERSION_PATTERN.match(tag.strip())]
+
+
+def is_shallow(repo: Path) -> bool:
+    return run_git(repo, ["rev-parse", "--is-shallow-repository"]).strip() == "true"
+
+
 def commits_since_latest_tag(repo: Path) -> tuple[str | None, list[Commit]]:
     previous_tag = latest_version_tag(repo)
     return previous_tag, read_commits(repo, previous_tag)
