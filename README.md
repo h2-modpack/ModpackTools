@@ -163,7 +163,11 @@ Before publishing releases, also add these GitHub Actions org secrets with
 - `RELEASE_DISPATCH_TOKEN`
 
 The GitHub PAT value for `RELEASE_DISPATCH_TOKEN` is still created manually in
-GitHub user settings.
+GitHub user settings. It needs **Contents: Read and write** on the shell repo
+(the release commits the updated submodule pointers there), and Contents: Read
+plus Actions: Read and write on the coordinator and module repos. Release All
+checks push access to the shell before it publishes anything, so a missing
+permission fails the run up front instead of after the releases.
 
 With All repositories access, every repo in the pack org can read the secrets.
 The shell, coordinator, and module repos are covered automatically.
