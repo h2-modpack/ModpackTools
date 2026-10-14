@@ -59,6 +59,10 @@ On Windows Command Prompt or PowerShell, use `ModpackTools\run.bat` instead of
 `ModpackTools/run`. The launcher picks an available Python 3 command
 (`python3`, `python`, or `py -3`).
 
+By default a new module is **standalone**: it ships with the pack (it boots in smoke, deploys
+locally and releases with it) but the coordinator does not depend on it, so installing the pack
+does not install the module. Pass `--dependency` to make the coordinator depend on it.
+
 `create.py` creates the GitHub repo from
 [`ModpackModuleTemplate`](https://github.com/h2-modpack/ModpackModuleTemplate),
 fills in module identity, commits the initial repo, registers it under
@@ -69,6 +73,29 @@ Generated module package names do not include the pack prefix because the pack
 team already carries that identity. For example, in a pack using
 `team = adamantSpeedrun`, `--package-id LiveSplit --title "LiveSplit"` creates
 `adamantSpeedrun-LiveSplit`. The package id is also the Lib module id.
+
+## Pack Membership: pack.toml
+
+`pack.toml` at the shell root lists the modules that are Thunderstore dependencies of the
+coordinator, by package id:
+
+```toml
+[dependencies]
+modules = ["Boonless", "LiveSplit", "QoL"]
+```
+
+Every registered module not listed is standalone. Everything dependency-related keys off the list:
+
+- the coordinator's managed dependency block lists only listed modules;
+- `validate_platform_versions.py` requires the coordinator to depend on exactly the listed modules
+  (a standalone module still needs the Lib dependency) and prints the standalone ones;
+- `Release All` pins only listed modules in the coordinator, and only their releases count toward
+  the coordinator's version bump, so a standalone module can release without releasing the pack.
+
+A name in `pack.toml` that is not a registered module is an error. A shell without `pack.toml`
+keeps the old behavior: every registered module is a dependency. Standalone modules declare the
+pack id in `createModule(...)` as usual, so they appear in the pack window when the pack is
+installed and show their own window when it is not.
 
 ## Local Deployment
 
@@ -127,6 +154,9 @@ Normal release maintenance is:
 
 1. Module, coordinator, or Lib repos change and are pushed with conventional commits.
 2. Run `Release All` from the shell repo when publishing the pack.
+
+Standalone modules (not in `pack.toml`) still release in a normal run, each at its own computed
+version, but they are not pinned in the coordinator and do not bump it.
 
 `Release All` checks out every child repo at its release branch head, so stale
 shell submodule pointers never block a release, and commits the new pointers back

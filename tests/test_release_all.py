@@ -844,6 +844,86 @@ def test_plan_versions_rejects_override_not_above_last_tag() -> None:
     assert_equal(entries[0].version, "5.2.2", "override above last tag")
 
 
+def make_pack_root(pack_toml: str | None, repos: list[str] | None = None) -> Path:
+    import tempfile
+
+    root = Path(tempfile.mkdtemp())
+    for repo in repos or MODULE_REPOS:
+        (root / "Submodules" / repo).mkdir(parents=True)
+        (root / "Submodules" / repo / "thunderstore.toml").write_text("", encoding="utf-8")
+    if pack_toml is not None:
+        (root / "pack.toml").write_text(pack_toml, encoding="utf-8")
+    return root
+
+
+def config_for(root: Path) -> release_all.ReleaseConfig:
+    return release_all.ReleaseConfig(
+        org="h2pack-rundirector",
+        team="adamantRunDirector",
+        coordinator_repo=COORDINATOR,
+        root=root,
+    )
+
+
+def test_dependency_module_repos_follows_pack_toml() -> None:
+    root = make_pack_root('[dependencies]\nmodules = ["BiomeControl", "GodPool"]\n')
+    names = release_all.dependency_module_repos(config_for(root))
+    assert_equal(names, {MODULE_REPOS[0], MODULE_REPOS[2]}, "dependency repos")
+
+
+def test_dependency_module_repos_is_none_without_pack_toml() -> None:
+    root = make_pack_root(None)
+    assert_equal(release_all.dependency_module_repos(config_for(root)), None, "legacy: everyone is a dependency")
+
+
+def test_dependency_module_repos_rejects_unknown_and_malformed_pack_toml() -> None:
+    unknown = make_pack_root('[dependencies]\nmodules = ["Ghost"]\n')
+    raises_release_error("Invalid pack.toml", lambda: release_all.dependency_module_repos(config_for(unknown)))
+    malformed = make_pack_root('[dependencies]\nmodules = "GodPool"\n')
+    raises_release_error("Invalid pack.toml", lambda: release_all.dependency_module_repos(config_for(malformed)))
+
+
+def test_standalone_module_release_does_not_bump_the_coordinator() -> None:
+    config = make_config()
+    plan = release_all.ReleasePlan(module_repos=[MODULE_REPOS[1]], coordinator_selected=True)
+    states = {
+        MODULE_REPOS[1]: ("1.0.0", 3, "minor"),
+        COORDINATOR: ("3.0.0", 0, None),
+    }
+    with patched(release_all, repo_release_state=fake_state(states)):
+        entries = release_all.plan_versions(config, plan, None, None, dependency_repos={MODULE_REPOS[0]})
+    by_repo = {entry.repo: entry for entry in entries}
+    assert_equal(by_repo[MODULE_REPOS[1]].version, "1.1.0", "standalone module still releases")
+    assert_equal(by_repo[COORDINATOR].version, None, "coordinator untouched")
+
+
+def test_dependency_module_release_still_bumps_the_coordinator() -> None:
+    config = make_config()
+    plan = release_all.ReleasePlan(module_repos=[MODULE_REPOS[0], MODULE_REPOS[1]], coordinator_selected=True)
+    states = {
+        MODULE_REPOS[0]: ("2.0.0", 1, "patch"),
+        MODULE_REPOS[1]: ("1.0.0", 3, "minor"),
+        COORDINATOR: ("3.0.0", 0, None),
+    }
+    with patched(release_all, repo_release_state=fake_state(states)):
+        entries = release_all.plan_versions(config, plan, None, None, dependency_repos={MODULE_REPOS[0]})
+    by_repo = {entry.repo: entry for entry in entries}
+    # Only the dependency module's patch counts, not the standalone module's minor bump.
+    assert_equal(by_repo[COORDINATOR].version, "3.0.1", "coordinator follows dependency modules only")
+
+
+def test_pins_cover_dependency_modules_only() -> None:
+    config = make_config()
+    entries = [
+        release_all.VersionPlanEntry(MODULE_REPOS[0], "module", "2.1.0", 3, "minor", "2.2.0", "commits"),
+        release_all.VersionPlanEntry(MODULE_REPOS[1], "module", None, 3, "minor", "1.0.0", "commits"),
+    ]
+    latest = {MODULE_REPOS[2]: "5.0.0"}
+    with patched(release_all.prep, latest_version_tag=lambda path: latest.get(path.name)):
+        pins = release_all.build_coordinator_version_pins(config, entries, [MODULE_REPOS[0], MODULE_REPOS[2]])
+    assert_equal(pins, {MODULE_REPOS[0]: "2.2.0", MODULE_REPOS[2]: "5.0.0"}, "standalone module not pinned")
+
+
 def main() -> int:
     tests = [
         test_mass_release_selects_all_modules_and_coordinator,
@@ -888,6 +968,12 @@ def main() -> int:
         test_repo_release_state_rejects_unreachable_latest_tag,
         test_repo_release_state_accepts_complete_history_and_new_repos,
         test_plan_versions_rejects_override_not_above_last_tag,
+        test_dependency_module_repos_follows_pack_toml,
+        test_dependency_module_repos_is_none_without_pack_toml,
+        test_dependency_module_repos_rejects_unknown_and_malformed_pack_toml,
+        test_standalone_module_release_does_not_bump_the_coordinator,
+        test_dependency_module_release_still_bumps_the_coordinator,
+        test_pins_cover_dependency_modules_only,
     ]
 
     for test in tests:

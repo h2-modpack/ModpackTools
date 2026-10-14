@@ -11,6 +11,8 @@ Usage (run from the shell repo root):
 
   --package-id Thunderstore package suffix and Lib module id.
   --title      Human display name.
+  --dependency Make the coordinator depend on the module (adds it to pack.toml). By default a new
+               module is standalone: it ships with the pack but is not installed by it.
 
 Normally the script discovers pack identity from the shell repo:
   Pack ID      : coordinator src/main.lua PACK_ID
@@ -36,6 +38,7 @@ import subprocess
 import re
 import tomllib
 from coordinator_deps import update_coordinator_deps
+from module_roster import set_new_module_membership
 
 
 TOOLS_DIR      = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -536,6 +539,12 @@ def main():
     parser.add_argument("--team", default=None, help="Override discovered pack Thunderstore team")
     parser.add_argument("--shared-team", default="adamant", help="Shared infrastructure team for Lib deps (default: adamant)")
     parser.add_argument("--org", default=None, help="Override discovered GitHub org")
+    parser.add_argument(
+        "--dependency",
+        action="store_true",
+        help="Make the new module a Thunderstore dependency of the coordinator (adds it to pack.toml). "
+             "Without it the module is standalone: it ships with the pack but is not installed by it.",
+    )
     args = parser.parse_args()
 
     try:
@@ -709,6 +718,9 @@ def main():
         "--branch", "main",
         clone_url, submodule_rel,
     ], cwd=ROOT_DIR)
+
+    print("\n>>> Recording pack membership...")
+    print("  " + set_new_module_membership(args.package_id, args.dependency))
 
     print("\n>>> Syncing coordinator module dependency block...")
     update_coordinator_deps()

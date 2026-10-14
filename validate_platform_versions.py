@@ -25,6 +25,9 @@ except ModuleNotFoundError:
 TOOLS_DIR = Path(__file__).resolve().parent
 ROOT = TOOLS_DIR.parent
 
+sys.path.insert(0, str(TOOLS_DIR / "new_module"))
+import module_roster  # noqa: E402
+
 
 def rel(path: Path) -> str:
     return path.relative_to(ROOT).as_posix()
@@ -84,16 +87,18 @@ def find_coordinator_toml() -> Path:
 
 def main() -> int:
     lib_path = ROOT / "adamant-ModpackLib" / "thunderstore.toml"
-    module_root = ROOT / "Submodules"
 
     try:
         lib_data = load_toml(lib_path)
         coordinator_path = find_coordinator_toml()
         coordinator_data = load_toml(coordinator_path)
-        module_paths = sorted(module_root.glob("*/thunderstore.toml"))
+        dependency_repos, standalone_repos = module_roster.split_module_repos(
+            module_roster.discover_module_repos(ROOT),
+            module_roster.read_dependency_modules(ROOT),
+        )
         lib_name = package_name(lib_path, lib_data)
         lib_version = package_version(lib_path, lib_data)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, module_roster.PackConfigError) as exc:
         print(f"::error::{exc}")
         return 1
 
@@ -108,26 +113,39 @@ def main() -> int:
     record_dependency(coordinator_path, coordinator_data, lib_name)
 
     loaded_modules: list[tuple[str, str]] = []
-    for module_path in module_paths:
+    standalone_modules: list[tuple[str, str]] = []
+    roster = [(repo, True) for repo in dependency_repos] + [(repo, False) for repo in standalone_repos]
+    for repo, is_dependency in roster:
+        module_path = repo.path / "thunderstore.toml"
         try:
             module_data = load_toml(module_path)
             module_name = package_name(module_path, module_data)
             module_version = package_version(module_path, module_data)
-            loaded_modules.append((module_name, module_version))
+            (loaded_modules if is_dependency else standalone_modules).append((module_name, module_version))
             record_dependency(module_path, module_data, lib_name)
-            record_dependency(coordinator_path, coordinator_data, module_name)
+            if is_dependency:
+                record_dependency(coordinator_path, coordinator_data, module_name)
+            elif dependency_version(coordinator_data, module_name) is not None:
+                errors.append(
+                    f"{rel(coordinator_path)} depends on standalone module {module_name}; "
+                    "list it in pack.toml or remove the dependency"
+                )
         except (OSError, ValueError) as exc:
             errors.append(str(exc))
 
     print("Platform version snapshot:")
     print(f"  {lib_name} {lib_version}")
     print(f"  {package_name(coordinator_path, coordinator_data)} {package_version(coordinator_path, coordinator_data)}")
-    print("  Modules:")
+    print("  Modules (coordinator dependencies):")
     if loaded_modules:
         for module_name, module_version in loaded_modules:
             print(f"    {module_name} {module_version}")
     else:
         print("    (none)")
+    if standalone_modules:
+        print("  Standalone modules (ship with the pack, not dependencies):")
+        for module_name, module_version in standalone_modules:
+            print(f"    {module_name} {module_version}")
     print("  Required dependency edges:")
     if dependency_edges:
         for path, dependency, actual in dependency_edges:

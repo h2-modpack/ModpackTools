@@ -6,7 +6,7 @@ import os
 import re
 from pathlib import Path
 
-from module_roster import discover_module_repos, find_coordinator_package
+from module_roster import PackConfigError, dependency_module_repos, find_coordinator_package, standalone_module_repos
 
 
 TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,7 +37,14 @@ def update_coordinator_deps():
     print(f"  Replacing managed block between '{MARKER_START}' and '{MARKER_END}'")
     print("  (infrastructure deps above the markers are left untouched)")
 
-    repos = discover_module_repos(Path(ROOT_DIR))
+    try:
+        repos = dependency_module_repos(Path(ROOT_DIR))
+        standalone = standalone_module_repos(Path(ROOT_DIR))
+    except PackConfigError as exc:
+        print(f"  ERROR {exc}")
+        raise SystemExit(1) from exc
+    for repo in standalone:
+        print(f"  standalone  {repo.dependency_id} (not in pack.toml dependencies; left out of the block)")
     lines = [f'{repo.dependency_id} = "{repo.dependency_version}"' for repo in repos]
     block = MARKER_START + "\n" + "\n".join(lines) + "\n" + MARKER_END
 

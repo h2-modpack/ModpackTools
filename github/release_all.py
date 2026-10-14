@@ -27,6 +27,8 @@ ROOT_DIR = TOOLS_DIR.parent
 VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 
 sys.path.insert(0, str(GITHUB_DIR))
+sys.path.insert(0, str(TOOLS_DIR / "new_module"))
+import module_roster  # noqa: E402
 import prepare_package_release as prep  # noqa: E402
 
 
@@ -108,6 +110,32 @@ def discover_module_repos(config: ReleaseConfig) -> list[str]:
             continue
         repos.append(entry.name)
     return repos
+
+
+def dependency_module_repos(config: ReleaseConfig, available_module_repos: list[str] | None = None) -> set[str] | None:
+    """Repo names of the modules that are Thunderstore dependencies of the coordinator.
+
+    Modules not in pack.toml's [dependencies] list are standalone: they release with the pack but are
+    neither pinned in the coordinator nor counted toward its version bump. None means the shell has no
+    pack.toml, so every module is a dependency.
+    """
+    try:
+        listed = module_roster.read_dependency_modules(config.root)
+    except module_roster.PackConfigError as exc:
+        raise ReleaseError("Invalid pack.toml", str(exc)) from exc
+    if listed is None:
+        return None
+
+    repos = discover_module_repos(config) if available_module_repos is None else list(available_module_repos)
+    prefix = config.module_prefix
+    by_package_id = {repo[len(prefix):] if repo.startswith(prefix) else repo: repo for repo in repos}
+    unknown = sorted(set(listed) - set(by_package_id))
+    if unknown:
+        raise ReleaseError(
+            "Invalid pack.toml",
+            f"pack.toml lists modules that are not checked-out module repos: {', '.join(unknown)}",
+        )
+    return {by_package_id[package_id] for package_id in listed}
 
 
 def _casefold_map(values: list[str]) -> dict[str, str]:
@@ -410,9 +438,15 @@ def plan_versions(
     plan: ReleasePlan,
     lockstep_tag: str | None = None,
     overrides: dict[str, str] | None = None,
+    dependency_repos: set[str] | None = None,
 ) -> list[VersionPlanEntry]:
-    """Resolve the version each selected repo will release, skipping repos with nothing to ship."""
+    """Resolve the version each selected repo will release, skipping repos with nothing to ship.
+
+    Only dependency modules (dependency_repos, or all when None) drive the coordinator's bump; a
+    standalone module releasing on its own leaves the coordinator untouched.
+    """
     overrides = overrides or {}
+    drives_coordinator = lambda repo: dependency_repos is None or repo in dependency_repos  # noqa: E731
     entries: list[VersionPlanEntry] = []
     module_bumps: list[str | None] = []
 
@@ -428,13 +462,14 @@ def plan_versions(
             version, source = None, "none"
         if version is not None and source != "lockstep":
             require_above_last_tag(repo, version, last_tag)
-            module_bumps.append(bump or "patch")
+            if drives_coordinator(repo):
+                module_bumps.append(bump or "patch")
         entries.append(VersionPlanEntry(repo, "module", last_tag, count, bump, version, source))
 
     if plan.coordinator_selected:
         repo = config.coordinator_repo
         last_tag, count, own_bump = repo_release_state(config, repo)
-        released_modules = any(entry.released for entry in entries)
+        released_modules = any(entry.released and drives_coordinator(entry.repo) for entry in entries)
         if lockstep_tag is not None:
             version, bump, source = lockstep_tag, own_bump, "lockstep"
         elif repo in overrides:
@@ -458,7 +493,10 @@ def build_coordinator_version_pins(
     entries: list[VersionPlanEntry],
     available_module_repos: list[str],
 ) -> dict[str, str]:
-    """Pin every module: released ones to their new version, the rest to their latest tag."""
+    """Pin every dependency module: released ones to their new version, the rest to their latest tag.
+
+    Pass only the coordinator's dependency modules; standalone modules must not be pinned.
+    """
     released = {entry.repo: entry.version for entry in entries if entry.kind == "module" and entry.version}
     pins: dict[str, str] = {}
     for repo in available_module_repos:
@@ -512,9 +550,11 @@ def write_step_summary(entries: list[VersionPlanEntry]) -> None:
         handle.write("\n".join(lines) + "\n")
 
 
-def print_version_plan(entries: list[VersionPlanEntry]) -> None:
+def print_version_plan(entries: list[VersionPlanEntry], standalone: list[str] | None = None) -> None:
     print("Release plan:")
     print(format_version_plan(entries))
+    if standalone:
+        print(f"  Standalone (not coordinator dependencies): {', '.join(standalone)}")
     write_step_summary(entries)
 
 
@@ -1032,16 +1072,19 @@ def run_computed_release(
     coordinator_fields: list[str],
 ) -> int:
     available_modules = discover_module_repos(config)
+    dependency_repos = dependency_module_repos(config, available_modules)
     overrides = parse_version_overrides(args.versions, config, available_modules)
-    entries = plan_versions(config, plan, None, overrides)
-    print_version_plan(entries)
+    entries = plan_versions(config, plan, None, overrides, dependency_repos)
+    standalone = [] if dependency_repos is None else sorted(set(available_modules) - dependency_repos)
+    print_version_plan(entries, standalone)
 
     if not any(entry.released for entry in entries):
         print("Nothing to release: no selected repo has releasable commits since its last tag.")
         return 0
 
     if args.pin_coordinator_module_deps:
-        pins = build_coordinator_version_pins(config, entries, available_modules)
+        pin_modules = [repo for repo in available_modules if dependency_repos is None or repo in dependency_repos]
+        pins = build_coordinator_version_pins(config, entries, pin_modules)
         pin_field = build_dependency_pins_field(pins)
         if pin_field is not None:
             coordinator_fields.append(pin_field)
@@ -1081,7 +1124,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.tag is None:
             return run_computed_release(config, plan, args, child_dry_run, repo_fields, module_fields, coordinator_fields)
         if args.pin_coordinator_module_deps:
-            dependency_pin_field = build_coordinator_dependency_pin_field(plan.module_repos, args.tag)
+            dependency_repos = dependency_module_repos(config)
+            pin_repos = [repo for repo in plan.module_repos if dependency_repos is None or repo in dependency_repos]
+            dependency_pin_field = build_coordinator_dependency_pin_field(pin_repos, args.tag)
             if dependency_pin_field is not None:
                 coordinator_fields.append(dependency_pin_field)
         print_plan(plan, config)

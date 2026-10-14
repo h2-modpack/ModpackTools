@@ -29,6 +29,7 @@ SUBMODULES_DIR = os.path.join(ROOT_DIR, "Submodules")
 GITMODULES     = os.path.join(ROOT_DIR, ".gitmodules")
 
 from coordinator_deps import update_coordinator_deps
+from module_roster import PACK_CONFIG_NAME, discover_module_repos, read_dependency_modules
 
 
 # =============================================================================
@@ -192,6 +193,15 @@ def main():
     # -------------------------------------------------------------------------
     print()
     update_coordinator_deps()
+
+    listed = read_dependency_modules()
+    if listed is None:
+        print(f"\n  NOTE: no {PACK_CONFIG_NAME}, so every registered module is a coordinator dependency.")
+    elif to_register:
+        listed_set = set(listed)
+        for repo in discover_module_repos():
+            if repo.package_id not in listed_set:
+                print(f"  NOTE: {repo.package_id} is standalone; add it to {PACK_CONFIG_NAME} to make the coordinator depend on it.")
 
 
 if __name__ == "__main__":
