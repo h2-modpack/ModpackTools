@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import sys
+import os
 import tempfile
 from pathlib import Path
 
@@ -105,6 +106,60 @@ def test_copy_tree_overwrites_existing_directory() -> None:
         assert_equal((target / "manifest.json").read_text(encoding="utf-8"), '{"new": true}\n', "copied manifest")
         if (target / "stale.txt").exists():
             raise AssertionError("expected stale file to be removed")
+
+
+def test_copy_tree_overwrite_syncs_in_place_and_keeps_directory() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source = root / "source"
+        target = root / "profile" / "plugins" / "Package"
+
+        (source / "nested").mkdir(parents=True)
+        (source / "main.lua").write_text("new\n", encoding="utf-8")
+        (source / "nested" / "ui.lua").write_text("ui\n", encoding="utf-8")
+        (target / "stale_dir").mkdir(parents=True)
+        (target / "stale.txt").write_text("old\n", encoding="utf-8")
+        (target / "stale_dir" / "gone.lua").write_text("old\n", encoding="utf-8")
+        (target / "main.lua").write_text("old\n", encoding="utf-8")
+        inode_before = os.stat(target).st_ino
+
+        copied = links.copy_tree(str(source), str(target), overwrite=True)
+
+        if not copied:
+            raise AssertionError("expected copy_tree to sync")
+        if os.stat(target).st_ino != inode_before:
+            raise AssertionError("expected copy_tree to keep the destination directory (watched by the game)")
+        if (target / "main.lua").read_text(encoding="utf-8") != "new\n":
+            raise AssertionError("expected changed file to be replaced")
+        if (target / "nested" / "ui.lua").read_text(encoding="utf-8") != "ui\n":
+            raise AssertionError("expected nested file to be copied")
+        if (target / "stale.txt").exists() or (target / "stale_dir").exists():
+            raise AssertionError("expected stale entries to be removed")
+
+
+def test_fast_copy_tree_seed_syncs_existing_directory_in_place() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source = root / "source"
+        target = root / "profile" / "plugins" / "Package"
+        cache = root / "profile" / ".adamant-deploy-cache" / "Package" / "plugins.json"
+
+        source.mkdir()
+        (source / "main.lua").write_text("new\n", encoding="utf-8")
+        target.mkdir(parents=True)
+        (target / "stale.txt").write_text("old\n", encoding="utf-8")
+        inode_before = os.stat(target).st_ino
+
+        links.fast_copy_tree(str(source), str(target), str(cache))
+
+        if os.stat(target).st_ino != inode_before:
+            raise AssertionError("expected seed to keep the destination directory")
+        if (target / "stale.txt").exists():
+            raise AssertionError("expected stale file to be removed")
+        if (target / "main.lua").read_text(encoding="utf-8") != "new\n":
+            raise AssertionError("expected source file to be copied")
+        if not cache.exists():
+            raise AssertionError("expected cache to be seeded")
 
 
 def test_fast_copy_tree_seeds_cache_with_full_copy() -> None:
@@ -262,6 +317,8 @@ def main() -> int:
         test_auto_mode_uses_symlink_for_same_side_profile,
         test_auto_mode_uses_copy_for_windows_python_wsl_unc_source,
         test_copy_tree_overwrites_existing_directory,
+        test_copy_tree_overwrite_syncs_in_place_and_keeps_directory,
+        test_fast_copy_tree_seed_syncs_existing_directory_in_place,
         test_fast_copy_tree_seeds_cache_with_full_copy,
         test_fast_copy_tree_trusts_cache_for_unchanged_files,
         test_fast_copy_tree_copies_changed_source_files_only,

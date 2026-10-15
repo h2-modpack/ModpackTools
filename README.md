@@ -135,6 +135,11 @@ cached metadata changed. It trusts the previous deploy cache and does not verify
 destination contents; use `--overwrite` to repair a profile after manual edits,
 cache drift, or suspicious live state.
 
+Both modes sync files inside the existing plugin directory instead of deleting
+and recreating it. The game's hot-reload watcher holds a handle on each plugin
+directory; deleting it breaks hot reload until the game restarts. See
+[local_deploy/README.md](local_deploy/README.md) for the full flag guidance.
+
 ## Local Checkout Tests
 
 To run a broader local assembled-checkout sweep from the shell repo root:

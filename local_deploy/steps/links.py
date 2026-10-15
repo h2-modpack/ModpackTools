@@ -100,7 +100,56 @@ def write_deploy_cache(cache_path, manifest, dest_root):
         handle.write("\n")
 
 
+def sync_tree_in_place(abs_target, abs_link):
+    """Make abs_link mirror abs_target without deleting the abs_link directory itself.
+
+    ReturnOfModding watches each plugin directory with ReadDirectoryChangesW. Deleting a
+    watched directory (rmtree + copytree) invalidates that handle with ACCESS_DENIED and the
+    game stops hot reloading until it restarts. Syncing file by file keeps the handle valid.
+    """
+    manifest = build_source_manifest(abs_target)
+    current_files = manifest["files"]
+    current_dirs = set(manifest["dirs"])
+
+    existing_files = set()
+    existing_dirs = set()
+    for current_root, dirnames, filenames in os.walk(abs_link):
+        rel_root = os.path.relpath(current_root, abs_link)
+        for dirname in dirnames:
+            rel_dir = dirname if rel_root == "." else os.path.join(rel_root, dirname)
+            existing_dirs.add(normalize_relpath(rel_dir))
+        for filename in filenames:
+            rel_file = filename if rel_root == "." else os.path.join(rel_root, filename)
+            existing_files.add(normalize_relpath(rel_file))
+
+    for relpath in sorted(existing_files - set(current_files)):
+        remove_existing(local_path(abs_link, relpath))
+
+    for relpath in sorted(existing_dirs - current_dirs, key=lambda value: value.count("/"), reverse=True):
+        remove_existing(local_path(abs_link, relpath))
+
+    for relpath in sorted(current_dirs, key=lambda value: value.count("/")):
+        dest_dir = local_path(abs_link, relpath)
+        if os.path.lexists(dest_dir) and not os.path.isdir(dest_dir):
+            remove_existing(dest_dir)
+        os.makedirs(dest_dir, exist_ok=True)
+
+    for relpath in current_files:
+        dest_file = local_path(abs_link, relpath)
+        if os.path.lexists(dest_file) and (os.path.islink(dest_file) or os.path.isdir(dest_file)):
+            remove_existing(dest_file)
+        shutil.copy2(local_path(abs_target, relpath), dest_file)
+
+    return manifest
+
+
 def seed_fast_copy(abs_target, abs_link, cache_path, manifest):
+    if os.path.isdir(abs_link) and not os.path.islink(abs_link):
+        sync_tree_in_place(abs_target, abs_link)
+        write_deploy_cache(cache_path, manifest, abs_link)
+        print(f"  FAST-SYNCED IN PLACE: {abs_link} (cache seeded)")
+        return True
+
     if os.path.exists(abs_link) or os.path.lexists(abs_link):
         remove_existing(abs_link)
 
@@ -186,6 +235,11 @@ def copy_tree(target, link_path, overwrite):
         if not overwrite:
             print(f"  SKIP (exists): {abs_link}")
             return False
+        if os.path.isdir(abs_link) and not os.path.islink(abs_link):
+            # Keep the directory itself: the game's file watcher holds a handle on it.
+            sync_tree_in_place(abs_target, abs_link)
+            print(f"  SYNCED IN PLACE: {abs_link}")
+            return True
         remove_existing(abs_link)
 
     os.makedirs(os.path.dirname(abs_link), exist_ok=True)

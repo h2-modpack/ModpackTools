@@ -2,6 +2,11 @@
 Full local deployment: staged package assets, manifests, profile links/copies, and git hooks.
 
 Usage: python deploy_all.py [--overwrite | --fast] [--profile NAME] [--skip-smoke]
+
+Flag guidance (see local_deploy/README.md):
+- no flag:     first deploy into a profile; existing entries are skipped.
+- --fast:      edit/test loop while the game runs (copy mode only); copies only changed files.
+- --overwrite: repair or full refresh; re-syncs every file, never deletes plugin directories.
 """
 
 import os
